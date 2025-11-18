@@ -1,0 +1,345 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          npm run lint > eslint-results.txt 2>&1
+          if [ $? -ne 0 ]; then
+            echo "eslint_failed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Prettier check
+        id: prettier
+        run: |
+          npm run format -- --check > prettier-results.txt 2>&1
+          if [ $? -ne 0 ]; then
+            echo "prettier_failed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Post Code Quality Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const eslintResults = fs.readFileSync('eslint-results.txt', 'utf8');
+            const prettierResults = fs.readFileSync('prettier-results.txt', 'utf8');
+            
+            let commentBody = '## Code Quality Report\n\n';
+            
+            if (${{ steps.eslint.outputs.eslint_failed }}) {
+              commentBody += '### ESLint ❌\n```\n' + eslintResults + '\n```\n';
+            } else {
+              commentBody += '### ESLint ✅ No issues found\n';
+            }
+            
+            if (${{ steps.prettier.outputs.prettier_failed }}) {
+              commentBody += '### Prettier ❌\n```\n' + prettierResults + '\n```\n';
+            } else {
+              commentBody += '### Prettier ✅ No formatting issues found\n';
+            }
+            
+            // Find and delete existing code quality comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            
+            const existingComment = comments.find(comment => 
+              comment.user.login === 'github-actions[bot]' && 
+              comment.body.includes('## Code Quality Report')
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id
+              });
+            }
+            
+            // Create new comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+  testing-suite:
+    name: Testing Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests with coverage
+        id: test
+        run: |
+          npm run test:coverage > test-results.txt 2>&1
+          if [ $? -ne 0 ]; then
+            echo "test_failed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+
+      - name: Post Test Coverage Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const testResults = fs.readFileSync('test-results.txt', 'utf8');
+            
+            // Extract coverage summary
+            const coverageSummary = testResults.split('----------|---------|----------|---------|---------|-------------------').pop() || '';
+            
+            let commentBody = '## Test Coverage Report\n\n';
+            
+            if (${{ steps.test.outputs.test_failed }}) {
+              commentBody += '### Tests ❌\n```\n' + testResults + '\n```\n';
+            } else {
+              commentBody += '### Tests ✅ All tests passed\n';
+            }
+            
+            commentBody += '### Coverage Summary\n```\n' + coverageSummary + '\n```\n';
+            
+            // Find and delete existing test coverage comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            
+            const existingComment = comments.find(comment => 
+              comment.user.login === 'github-actions[bot]' && 
+              comment.body.includes('## Test Coverage Report')
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id
+              });
+            }
+            
+            // Create new comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability check
+        id: npm-audit
+        run: |
+          npm audit --audit-level=moderate > npm-audit-results.txt 2>&1
+          if [ $? -ne 0 ]; then
+            echo "vulnerabilities_found=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run secret scanning
+        id: secret-scan
+        uses: trufflesecurity/trufflehog@v3.61.0
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          output: secret-scan-results.txt
+
+      - name: Post Security Scan Report
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const npmAuditResults = fs.readFileSync('npm-audit-results.txt', 'utf8');
+            
+            let secretScanResults = 'No secrets found';
+            if (fs.existsSync('secret-scan-results.txt')) {
+              secretScanResults = fs.readFileSync('secret-scan-results.txt', 'utf8');
+            }
+            
+            let commentBody = '## Security Scan Report\n\n';
+            
+            if (${{ steps.npm-audit.outputs.vulnerabilities_found }}) {
+              commentBody += '### Dependencies ❌ Vulnerabilities found\n```\n' + npmAuditResults + '\n```\n';
+            } else {
+              commentBody += '### Dependencies ✅ No moderate or higher vulnerabilities found\n';
+            }
+            
+            commentBody += '### Secrets Scan\n```\n' + secretScanResults + '\n```\n';
+            
+            // Find and delete existing security scan comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            
+            const existingComment = comments.find(comment => 
+              comment.user.login === 'github-actions[bot]' && 
+              comment.body.includes('## Security Scan Report')
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id
+              });
+            }
+            
+            // Create new comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+  build-validation:
+    name: Build Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: |
+          npm run build > build-results.txt 2>&1
+          if [ $? -ne 0 ]; then
+            echo "build_failed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Start application
+        run: |
+          npm start &
+          sleep 5
+
+      - name: Validate endpoints
+        id: endpoints
+        run: |
+          npm run health-check > endpoint-results.txt 2>&1
+          if [ $? -ne 0 ]; then
+            echo "endpoints_failed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create deployment preview artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: |
+            src/
+            package.json
+            package-lock.json
+
+      - name: Post Build Validation
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const buildResults = fs.readFileSync('build-results.txt', 'utf8');
+            const endpointResults = fs.readFileSync('endpoint-results.txt', 'utf8');
+            
+            let commentBody = '## Build Validation\n\n';
+            
+            if (${{ steps.build.outputs.build_failed }}) {
+              commentBody += '### Build ❌\n```\n' + buildResults + '\n```\n';
+            } else {
+              commentBody += '### Build ✅ Successful\n```\n' + buildResults + '\n```\n';
+            }
+            
+            if (${{ steps.endpoints.outputs.endpoints_failed }}) {
+              commentBody += '### Endpoints ❌\n```\n' + endpointResults + '\n```\n';
+            } else {
+              commentBody += '### Endpoints ✅ All accessible\n```\n' + endpointResults + '\n```\n';
+            }
+            
+            // Find and delete existing build validation comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            
+            const existingComment = comments.find(comment => 
+              comment.user.login === 'github-actions[bot]' && 
+              comment.body.includes('## Build Validation')
+            );
+            
+            if (existingComment) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existingComment.id
+              });
+            }
+            
+            // Create new comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
